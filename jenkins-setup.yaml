@@ -1,0 +1,192 @@
+---
+
+- name: Jenkins setup automation
+  hosts: jenkinses
+  become: true
+  tasks:
+
+    - name: Check if proxy definition exists
+      stat:
+        path: '{{ proxy_file_location }}'
+      register: proxy_file_stat_result
+
+    - name: Copy the proxy file template
+      copy: content='\n' dest='{{ proxy_file_location }}'
+      when: proxy_file_stat_result.stat.exists == False
+
+    - name: Environment file - add empty line if empty file
+      lineinfile: dest='{{ proxy_file_location }}' regexp='^$' line='' state=present
+
+    - name: proxy add http_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='http_proxy=' line='http_proxy={{ http_proxy }}' state=present
+      when: http_proxy is defined 
+
+    - name: proxy remove http_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='http_proxy=' state=absent
+      when: http_proxy is not defined 
+
+    - name: proxy add https_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='https_proxy=' line='https_proxy={{ https_proxy }}' state=present
+      when: https_proxy is defined 
+
+    - name: proxy remove https_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='https_proxy=' state=absent
+      when: https_proxy is not defined 
+
+    - name: proxy add no_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='no_proxy=' line='no_proxy="{{ no_proxy }}"' state=present
+      when: no_proxy is defined 
+
+    - name: proxy remove no_proxy
+      lineinfile: dest='{{ proxy_file_location }}' regexp='no_proxy=' state=absent
+      when: no_proxy is not defined 
+
+
+    - name: Install dependencies
+      yum: name={{ item }} state=latest update_cache=yes
+      with_items:
+        - git
+        - java
+
+    - name: add jenkins repo
+      get_url: url=http://pkg.jenkins-ci.org/redhat-stable/jenkins.repo dest=/etc/yum.repos.d/jenkins.repo
+
+    - name: add jenkins repo key
+      rpm_key: state=present key=https://jenkins-ci.org/redhat/jenkins-ci.org.key
+
+    - name: Install Jenkins
+      yum: name=jenkins state=latest update_cache=yes
+
+    - name: Change jenkins config - /var/lib/jenkins to '{{jenkins_home}}'
+      lineinfile: dest=/etc/sysconfig/jenkins regexp='JENKINS_HOME=' line='JENKINS_HOME="{{jenkins_home}}"' state=present
+
+    - name: Make dir '{{jenkins_home}}'
+      file: path='{{jenkins_home}}' state=directory owner=jenkins group=jenkins mode="u+rwx,g-w,o-w"
+
+    - name: Change jenkins system user to '{{jenkins_home}}'
+      user: name=jenkins home='{{jenkins_home}}' createhome=no
+
+
+    - name: Copy the proxy file template
+      template: src='proxy.xml.j2' dest='{{ jenkins_home }}/proxy.xml' owner=jenkins
+      when: (jenkins_http_proxy is defined)
+
+    - name: Jenkins proxy removal
+      file: path='{{ jenkins_home }}/proxy.xml' state=absent
+      when: jenkins_http_proxy is not defined 
+
+
+    - name: Restart Jenkins
+      service: name=jenkins state=restarted
+      changed_when: false
+
+    - name: Wait for Jenkins to start up
+      uri:
+        url: http://localhost:8080
+        status_code: 200,403
+        timeout: 5
+      register: jenkins_service_status
+      retries: 60
+      delay: 5
+      until: >
+         'status' in jenkins_service_status and
+         (jenkins_service_status['status'] == 200 or
+         jenkins_service_status['status'] == 403)
+
+
+    - name: Set Jenkins admin user fact
+      set_fact:
+        jenkins_admin_username: admin
+      no_log: true
+      changed_when: false
+      when: jenkins_admin_username is not defined
+
+    - name: Read initialAdminPassword file
+      command: "cat {{ jenkins_home }}/secrets/initialAdminPassword"
+      register: initialAdminPassword
+      no_log: true
+      changed_when: false
+      when: jenkins_admin_password is not defined
+
+    - name: Set Jenkins admin password fact
+      set_fact:
+        jenkins_admin_password: "{{ initialAdminPassword.stdout }}"
+      no_log: true
+      changed_when: false
+      when: jenkins_admin_password is not defined
+
+    - name: Extract admin password for printing
+      command: "echo {{ jenkins_admin_password }}"
+      register: myecho
+      changed_when: false
+      no_log: true
+
+    - name: Print admin password
+      debug: msg="{{myecho.stdout}}"
+
+
+#bug workaround - previous waiting did not inlude credentials and sometimes loading first plugin failed (403 does not mean fully loaded)
+    - name: Wait for Jenkins to start up (with credentials)
+      uri:
+        url: 'http://localhost:8080/login?j_username={{ jenkins_admin_username }}&j_password={{ jenkins_admin_password }}'
+        status_code: 200
+        timeout: 5
+      register: jenkins_service_status
+      retries: 60
+      delay: 5
+      until: >
+         'status' in jenkins_service_status and
+         (jenkins_service_status['status'] == 200)
+
+
+    - name: Install plugins without a specific version
+      jenkins_plugin:
+        name: "{{ item.key }}"
+        params:
+          url_username: "{{ jenkins_admin_username }}"
+          url_password: "{{ jenkins_admin_password }}"
+          timeout: 90
+        jenkins_home: "{{ jenkins_home }}"
+      when: >
+        'version' not in item.value
+      with_dict: "{{ jenkins_plugins }}"
+
+    - name: Install plugins with a specific version
+      jenkins_plugin:
+        name: "{{ item.key }}"
+        params:
+          url_username: "{{ jenkins_admin_username }}"
+          url_password: "{{ jenkins_admin_password }}"
+          timeout: 90
+        jenkins_home: "{{ jenkins_home }}"
+        version: "{{ item.value['version'] }}"
+      when: >
+        'version' in item.value
+      with_dict: "{{ jenkins_plugins }}"
+
+
+    - name: Mailer plugin configuration
+      template: src='hudson.tasks.Mailer.xml.j2' dest='{{ jenkins_home }}/hudson.tasks.Mailer.xml' owner=jenkins
+
+    - name: Email-ext plugin configuration
+      template: src='hudson.plugins.emailext.ExtendedEmailPublisher.xml.j2' dest='{{ jenkins_home }}/hudson.plugins.emailext.ExtendedEmailPublisher.xml' owner=jenkins
+
+    - name: Jenkins admin email address
+      template: src='jenkins.model.JenkinsLocationConfiguration.xml.j2' dest='{{ jenkins_home }}/jenkins.model.JenkinsLocationConfiguration.xml' owner=jenkins
+
+
+    - name: Restart Jenkins
+      service: name=jenkins state=restarted
+      changed_when: false
+
+    - name: Wait for Jenkins to start up (with credentials)
+      uri:
+        url: 'http://localhost:8080/login?j_username={{ jenkins_admin_username }}&j_password={{ jenkins_admin_password }}'
+        status_code: 200
+        timeout: 5
+      register: jenkins_service_status
+      retries: 60
+      delay: 5
+      until: >
+         'status' in jenkins_service_status and
+         (jenkins_service_status['status'] == 200)
